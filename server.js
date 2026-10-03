@@ -93,7 +93,7 @@ function unwrapInput(raw) {
 
 // tRPC handler - supports both admin.X and X formats
 function handleProcedure(fullPath, rawInput, req, res) {
-  const procedure = fullPath.replace(/^admin\./, '');
+  const procedure = fullPath.replace(/^(admin|applications)\./, '');
   const input = unwrapInput(rawInput);
 
   switch (procedure) {
