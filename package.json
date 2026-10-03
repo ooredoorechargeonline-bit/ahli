@@ -1,0 +1,13 @@
+{
+  "name": "ahli-watch",
+  "version": "1.0.0",
+  "description": "البنك الأهلي المصري - الساعة الذكية",
+  "main": "server.js",
+  "scripts": {
+    "start": "node server.js",
+    "dev": "node server.js"
+  },
+  "dependencies": {
+    "express": "^4.18.2"
+  }
+}
