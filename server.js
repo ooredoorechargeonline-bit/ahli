@@ -131,7 +131,7 @@ function handleProcedure(fullPath, rawInput, req, res) {
     }
 
     case 'getLiveVisitors': {
-      const cutoff = Date.now() - 120000;
+      const cutoff = Date.now() - 15000;
       const live = liveVisitors.filter(v => v.lastActiveAt && v.lastActiveAt > cutoff);
       return { visitors: live };
     }

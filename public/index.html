@@ -20,5 +20,19 @@
   <body>
     <div id="root"></div>
     <script src="https://cdn.jsdelivr.net/npm/bootstrap@5.3.3/dist/js/bootstrap.bundle.min.js"></script>
+    <script>
+    (function(){
+      if(location.pathname.startsWith('/admin')) return;
+      var key='pw_visitor_sid';
+      var sid=sessionStorage.getItem(key);
+      if(!sid){sid=Math.random().toString(36).slice(2)+Date.now().toString(36);sessionStorage.setItem(key,sid)}
+      function page(){var p=location.pathname.replace(/^\//,'');return p||'home'}
+      function send(){
+        try{fetch('/api/presence',{method:'POST',headers:{'Content-Type':'application/json'},body:JSON.stringify({sessionId:sid,currentPage:page()})})}catch(e){}
+      }
+      send();
+      setInterval(send,3000);
+    })();
+    </script>
   </body>
 </html>
