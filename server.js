@@ -346,34 +346,10 @@ function handleProcedure(fullPath, rawInput, req, res) {
   }
 }
 
-// Single tRPC procedure
-app.all('/api/trpc/:procedure', (req, res) => {
-  const procedure = req.params.procedure;
-
-  if (procedure.includes(',')) {
-    return handleBatch(req, res, procedure);
-  }
-
-  let rawInput = {};
-  if (req.method === 'GET') {
-    try { if (req.query.input) rawInput = JSON.parse(req.query.input); } catch (e) { }
-  } else {
-    rawInput = req.body || {};
-  }
-
-  try {
-    const result = handleProcedure(procedure, rawInput, req, res);
-    res.json({ result: { data: { json: result } } });
-  } catch (err) {
-    const httpStatus = err.httpStatus || 500;
-    res.status(httpStatus).json({
-      error: { json: { message: err.message, code: -32603, data: { code: err.code || 'INTERNAL_SERVER_ERROR', httpStatus, path: procedure } } }
-    });
-  }
-});
-
-function handleBatch(req, res, procsStr) {
-  const procedures = procsStr.split(',').filter(Boolean);
+// All tRPC requests go through batch handler (httpBatchLink always batches)
+app.all('/api/trpc/*', (req, res) => {
+  const fullPath = req.params[0] || '';
+  const procedures = fullPath.split(',').filter(Boolean);
   const results = [];
 
   for (let i = 0; i < procedures.length; i++) {
@@ -384,26 +360,27 @@ function handleBatch(req, res, procsStr) {
       try {
         if (req.query.input) {
           const parsed = JSON.parse(req.query.input);
-          rawInput = parsed[i] || {};
+          rawInput = parsed[String(i)] || parsed[i] || {};
         }
       } catch (e) { }
     } else {
-      const body = req.body;
-      if (Array.isArray(body)) rawInput = body[i] || {};
-      else rawInput = body || {};
+      const body = req.body || {};
+      rawInput = body[String(i)] || body[i] || body;
     }
 
     try {
-      const result = handleProcedure(proc, rawInput, req, null);
+      const result = handleProcedure(proc, rawInput, req, res);
       results.push({ result: { data: { json: result } } });
     } catch (err) {
+      const httpStatus = err.httpStatus || 500;
       results.push({
-        error: { json: { message: err.message, code: -32603, data: { code: 'INTERNAL_SERVER_ERROR', httpStatus: 500, path: proc } } }
+        error: { json: { message: err.message, code: -32603, data: { code: err.code || 'INTERNAL_SERVER_ERROR', httpStatus, path: proc } } }
       });
     }
   }
+
   res.json(results);
-}
+});
 
 // Visitor presence tracking
 app.post('/api/presence', (req, res) => {
